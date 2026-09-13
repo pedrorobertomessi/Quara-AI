@@ -1,0 +1,26 @@
+{
+  "name": "quara-server",
+  "version": "1.0.0",
+  "description": "Quara AI — copiloto da Paulista Jr: precificação, projeções financeiras, pesquisa, consulta processual, e geração de contratos, apresentações e imagens",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test_logica.js && node test_contexto.js && node test_api.js && node test_concurrency.js && node test_gg.js && node test_chat.js && node test_ferramentas.js",
+    "test:logica": "node test_logica.js && node test_contexto.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "docx": "^9.7.1",
+    "express": "^5.2.1",
+    "groq-sdk": "^1.6.0",
+    "pg": "^8.23.0",
+    "pptxgenjs": "^4.0.1",
+    "sharp": "^0.35.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

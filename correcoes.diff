@@ -1,0 +1,617 @@
+--- db.js.orig	2026-09-13 05:13:48.759848048 +0000
++++ db.js	2026-09-13 05:14:25.941256984 +0000
+@@ -37,8 +37,61 @@
+ const pool = new Pool({
+   connectionString,
+   ssl: querSsl(connectionString) ? { rejectUnauthorized: false } : false,
++  // O Postgres do Render (e o proxy de rede na frente dele) encerra conexões ociosas sem avisar o
++  // cliente. Sem estes limites o pool guarda para sempre um socket que já morreu do outro lado, e a
++  // próxima query nele falha com ECONNRESET. Reciclar por tempo é mais barato que descobrir o
++  // problema na hora de usar.
++  max: Number(process.env.PGPOOL_MAX) || 8,
++  idleTimeoutMillis: 20_000,
++  connectionTimeoutMillis: 10_000,
++  maxLifetimeSeconds: 900,
++  keepAlive: true,
++  keepAliveInitialDelayMillis: 10_000,
+ });
+ 
++// ESTA É A LINHA QUE MAIS IMPORTA NESTE ARQUIVO.
++// O Pool do pg é um EventEmitter. Quando uma conexão OCIOSA morre (o Render reinicia o banco, a
++// rede oscila, o plano gratuito derruba o socket), o pool emite 'error'. Um EventEmitter que emite
++// 'error' SEM NENHUM listener registrado faz o Node lançar uma exceção não capturada — e o processo
++// inteiro morre, levando junto todas as requisições em andamento. Não é um erro da requisição: é
++// uma conexão parada no pool que caiu sozinha, e não tinha por que derrubar o servidor.
++pool.on('error', (err) => {
++  console.error('[pg] conexão ociosa caiu e foi descartada (o servidor continua de pé):', err && err.message);
++});
++
++// Erros de CONEXÃO (não de SQL) merecem uma segunda tentativa: são quase sempre o socket morto
++// descrito acima, e a query em si está correta. Uma retentativa transforma um 500 na cara do
++// usuário em um hiccup de 300ms que ninguém percebe. Erros de SQL (sintaxe, constraint) NÃO são
++// retentados — repetir não muda o resultado e só mascara bug.
++const CODIGOS_TRANSITORIOS = new Set([
++  'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ENETUNREACH',
++  '08000', '08003', '08006', '08001', '08004', // classe 08: falha de conexão
++  '57P01', '57P02', '57P03', // admin desligou / crash / não aceitando conexões
++]);
++
++function ehTransitorio(e) {
++  if (!e) return false;
++  if (CODIGOS_TRANSITORIOS.has(e.code)) return true;
++  const m = String(e.message || '');
++  return /Connection terminated|terminating connection|server closed the connection|socket hang up|read ECONNRESET|timeout exceeded when trying to connect/i.test(m);
++}
++
++const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
++
++const queryDireta = pool.query.bind(pool);
++pool.query = async function queryComRetentativa(...args) {
++  // Forma com callback (não usada neste projeto) passa direto, sem retentativa.
++  if (typeof args[args.length - 1] === 'function') return queryDireta(...args);
++  try {
++    return await queryDireta(...args);
++  } catch (e) {
++    if (!ehTransitorio(e)) throw e;
++    console.warn('[pg] query falhou por conexão (%s) — tentando de novo uma vez', e.code || e.message);
++    await esperar(300);
++    return queryDireta(...args);
++  }
++};
++
+ async function migrate() {
+   await pool.query(`
+     CREATE TABLE IF NOT EXISTS historico (
+@@ -171,17 +224,49 @@
+ 
+ async function transaction(callback) {
+   const client = await pool.connect();
++  let conexaoQuebrada = false;
+   try {
+     await client.query('BEGIN');
+     const result = await callback(client);
+     await client.query('COMMIT');
+     return result;
+   } catch (e) {
+-    await client.query('ROLLBACK');
++    // Se a conexão caiu no meio da transação, o próprio ROLLBACK também falha. Deixar esse segundo
++    // erro subir trocaria a causa real ("violação de constraint X") por um genérico "Connection
++    // terminated", escondendo o problema de verdade de quem for depurar depois.
++    try {
++      await client.query('ROLLBACK');
++    } catch (erroRollback) {
++      conexaoQuebrada = true;
++      console.error('[pg] ROLLBACK falhou — a conexão será destruída:', erroRollback && erroRollback.message);
++    }
+     throw e;
+   } finally {
+-    client.release();
++    // release(err) manda o pg DESTRUIR a conexão em vez de devolvê-la ao pool. Devolver uma conexão
++    // possivelmente dentro de uma transação aberta contaminaria a próxima requisição que a pegasse.
++    client.release(conexaoQuebrada ? new Error('conexão descartada após falha de ROLLBACK') : undefined);
++  }
++}
++
++// A migração roda uma única vez, na subida do processo. No Render o app costuma subir ANTES de o
++// Postgres estar aceitando conexões (e, no plano gratuito, o banco pode estar acordando). Falhar de
++// primeira e chamar process.exit(1) ali vira crash loop: o Render reinicia, o banco ainda não está
++// pronto, morre de novo. Tentar algumas vezes com espera crescente resolve sozinho o caso comum.
++async function migrateComRetentativa(tentativas = 5) {
++  let ultimoErro;
++  for (let i = 1; i <= tentativas; i++) {
++    try {
++      await migrate();
++      return;
++    } catch (e) {
++      ultimoErro = e;
++      if (i === tentativas) break;
++      const espera = Math.min(15_000, 1000 * 2 ** (i - 1));
++      console.warn(`[pg] migração falhou (tentativa ${i}/${tentativas}): ${e.message} — nova tentativa em ${espera}ms`);
++      await esperar(espera);
++    }
+   }
++  throw ultimoErro;
+ }
+ 
+-module.exports = { pool, migrate, transaction };
++module.exports = { pool, migrate, migrateComRetentativa, transaction };
+--- chat.js.orig	2026-09-13 05:13:48.764082689 +0000
++++ chat.js	2026-09-13 05:15:54.097668533 +0000
+@@ -34,14 +34,53 @@
+ // Sem teto, um modelo em laço fechado consumiria a cota diária inteira numa pergunta só.
+ const MAX_PASSOS = 6;
+ 
+-// Resultado de ferramenta vira texto no contexto do modelo. Uma página web lida inteira ou uma
+-// lista de 200 vendas estouraria a janela e empurraria a pergunta original para fora dela.
+-const MAX_CHARS_RESULTADO = 24000;
++// ---------- Orçamento de contexto ----------
++// Aqui estava a causa de o chat "cair" depois de algumas mensagens numa mesma conversa.
++//
++// O histórico crescia para sempre: cada resultado de ferramenta (até 24.000 caracteres) entrava nele
++// e nunca mais saía, e o histórico inteiro era reenviado a CADA mensagem. Duas ou três perguntas que
++// usassem ferramentas já somavam dezenas de milhares de tokens por requisição. O que acontece a
++// partir daí não é aleatório — é determinístico: o limite de tokens por minuto da conta estoura,
++// a API devolve 429/413, o servidor converte isso em "O chat está indisponível no momento", e como o
++// histórico só cresce, TODA mensagem seguinte daquela conversa falha igual. Parecia instabilidade;
++// era a conversa tendo engordado além do que a cota aguenta.
++//
++// Três tetos resolvem isso, do mais específico para o mais geral:
++const MAX_CHARS_RESULTADO = 12000;            // resultado de ferramenta DENTRO do passo em que foi pedido
++const MAX_CHARS_RESULTADO_HISTORICO = 2500;   // o que sobra dele nas mensagens SEGUINTES
++const MAX_CHARS_LOTE_FERRAMENTAS = 40000;     // soma de todos os resultados de um mesmo passo
++const MAX_CHARS_HISTORICO = 45000;            // ~11k tokens de conversa acumulada
++const MAX_MENSAGENS_HISTORICO = 40;
++
++// Teto explícito de saída. Não é só economia: o Groq reserva o teto PEDIDO contra o limite de tokens
++// por minuto antes mesmo de gerar qualquer coisa. Sem max_tokens, a reserva é o máximo do modelo
++// (dezenas de milhares de tokens), o que sozinho já estoura a cota de uma conta gratuita e volta
++// como erro sem ter gerado uma única palavra.
++const MAX_TOKENS_PASSO = 1500;      // passos intermediários só precisam emitir chamadas de ferramenta
++const MAX_TOKENS_RESPOSTA = 3000;   // o passo final é o que escreve a resposta para a pessoa
++
++// Uma chamada que nunca responde prende a requisição, e as requisições presas acumulam até o
++// processo ficar sem memória. Melhor desistir em 45s e dizer isso do que pendurar a tela.
++const TIMEOUT_GROQ_MS = Number(process.env.GROQ_TIMEOUT_MS) || 45000;
++
++// Um cliente por chave, reaproveitado. Criar um Groq() a cada requisição criava também um pool de
++// conexões HTTP novo a cada requisição — conexões que ficavam abertas esperando o coletor de lixo.
++let clienteCache = null;
++let chaveDoCache = null;
+ 
+ function getClient() {
+   const apiKey = process.env.GROQ_API_KEY;
+   if (!apiKey) return null;
+-  return new Groq({ apiKey });
++  if (clienteCache && chaveDoCache === apiKey) return clienteCache;
++  chaveDoCache = apiKey;
++  clienteCache = new Groq({
++    apiKey,
++    timeout: TIMEOUT_GROQ_MS,
++    // O SDK já respeita o cabeçalho retry-after num 429. Duas tentativas cobrem o pico de um
++    // segundo sem virar uma tempestade de retentativas em cima de uma cota já estourada.
++    maxRetries: 2,
++  });
++  return clienteCache;
+ }
+ 
+ // ---------- Mensagem de sistema ----------
+@@ -85,9 +124,78 @@
+ 
+ // ---------- Execução de ferramentas ----------
+ 
+-function truncar(texto) {
+-  if (texto.length <= MAX_CHARS_RESULTADO) return texto;
+-  return texto.slice(0, MAX_CHARS_RESULTADO) + `\n\n[...resultado cortado em ${MAX_CHARS_RESULTADO} caracteres]`;
++function truncar(texto, limite = MAX_CHARS_RESULTADO) {
++  if (texto.length <= limite) return texto;
++  return texto.slice(0, limite) + `\n\n[...resultado cortado em ${limite} caracteres]`;
++}
++
++// ---------- Poda do histórico ----------
++
++function tamanhoMensagem(m) {
++  if (!m) return 0;
++  let n = typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content || '').length;
++  if (Array.isArray(m.tool_calls)) n += JSON.stringify(m.tool_calls).length;
++  return n + 20; // sobrecarga do envelope (role, ids)
++}
++
++// A mensagem do assistente devolvida pelo modelo carrega campos que só servem para aquele instante
++// — o rascunho de raciocínio do gpt-oss, por exemplo, que pode ser maior que a própria resposta.
++// Guardar isso no histórico é pagar o mesmo texto de novo em toda mensagem futura da conversa.
++function limparMensagemAssistente(m) {
++  if (!m || m.role !== 'assistant') return m;
++  const limpa = { role: 'assistant', content: m.content || '' };
++  if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
++    limpa.tool_calls = m.tool_calls.map((c) => ({
++      id: c.id,
++      type: c.type || 'function',
++      function: { name: c.function.name, arguments: c.function.arguments },
++    }));
++  }
++  return limpa;
++}
++
++/**
++ * Reduz o histórico ao que cabe no orçamento, sem quebrar a conversa.
++ *
++ * A regra que não pode ser violada: uma mensagem `tool` precisa vir logo depois da mensagem do
++ * assistente que pediu aquela ferramenta. Cortar no meio de um par desses deixa um `tool_call_id`
++ * órfão, e a API rejeita a requisição inteira com 400 — o corte "para economizar" derrubaria o chat
++ * de um jeito pior que o problema que veio resolver. Por isso o corte só acontece em mensagem de
++ * `user`, que é sempre um começo de turno seguro.
++ */
++function podarHistorico(mensagens) {
++  const lista = (Array.isArray(mensagens) ? mensagens : []).filter((m) => m && m.role && m.role !== 'system');
++  if (!lista.length) return [];
++
++  // Resultados de ferramenta de turnos passados ficam só com o começo: o modelo já os usou no turno
++  // em que foram pedidos, e o que importa daqui para frente é lembrar QUE foram consultados e o
++  // essencial do que disseram. Se precisar do detalhe outra vez, consulta de novo.
++  const compactada = lista.map((m) =>
++    m.role === 'tool' && typeof m.content === 'string'
++      ? { ...m, content: truncar(m.content, MAX_CHARS_RESULTADO_HISTORICO) }
++      : limparMensagemAssistente(m)
++  );
++
++  let inicio = 0;
++  let total = compactada.reduce((a, m) => a + tamanhoMensagem(m), 0);
++
++  // Avança o início enquanto estourar o orçamento, sempre parando numa mensagem de `user`.
++  while (inicio < compactada.length && (total > MAX_CHARS_HISTORICO || compactada.length - inicio > MAX_MENSAGENS_HISTORICO)) {
++    total -= tamanhoMensagem(compactada[inicio]);
++    inicio++;
++    while (inicio < compactada.length && compactada[inicio].role !== 'user') {
++      total -= tamanhoMensagem(compactada[inicio]);
++      inicio++;
++    }
++  }
++
++  const podada = compactada.slice(inicio);
++
++  // Rede de segurança: se por qualquer motivo a fatia começar com `tool` (histórico vindo de uma
++  // versão antiga do front-end, por exemplo), joga fora o prefixo órfão.
++  let i = 0;
++  while (i < podada.length && podada[i].role === 'tool') i++;
++  return i ? podada.slice(i) : podada;
+ }
+ 
+ // Falha de ferramenta volta para o modelo como resultado, não como exceção que derruba a resposta.
+@@ -130,7 +238,9 @@
+  * guarda estado entre requisições.)
+  */
+ async function conduzirTurno({ client, mensagem, historico, contexto }) {
+-  const anteriores = Array.isArray(historico) ? historico : [];
++  // Poda ANTES de montar a requisição: o histórico chega do navegador e é a única parte deste
++  // payload que cresce sem limite natural.
++  const anteriores = podarHistorico(historico);
+   const mensagens = [{ role: 'system', content: montarSystemPrompt(contexto) }, ...anteriores, { role: 'user', content: mensagem }];
+ 
+   // Acumula o turno separado da mensagem de sistema: ela é sempre reconstruída no início da
+@@ -145,17 +255,45 @@
+     const resposta = await client.chat.completions.create({
+       model: GROQ_MODEL,
+       messages: mensagens,
++      max_tokens: ultimoPasso ? MAX_TOKENS_RESPOSTA : MAX_TOKENS_PASSO,
+       // No último passo as ferramentas saem da mesa: o modelo é obrigado a responder com o que já
+       // levantou, em vez de pedir mais uma e ficar sem turno para formular a resposta.
+       ...(ultimoPasso ? {} : { tools: registro.declaracoes() }),
+     });
+ 
+-    const escolha = resposta.choices[0];
++    const escolha = resposta && Array.isArray(resposta.choices) ? resposta.choices[0] : null;
++    // Resposta sem `choices` acontece de verdade (corte de conexão, resposta de erro que ainda vem
++    // com 200). Antes disso aqui virava "Cannot read properties of undefined", que o server.js
++    // traduzia como "o chat está indisponível" — mensagem errada para um problema pontual. Se já
++    // houve passos úteis, aproveita o que foi levantado em vez de jogar o turno inteiro fora.
++    if (!escolha || !escolha.message) {
++      if (passo === 1) throw new Error('A API do modelo devolveu uma resposta vazia.');
++      return {
++        tipo: 'resposta',
++        texto: 'Consultei o que precisava, mas a resposta do modelo veio incompleta no último passo. Me pergunte de novo que eu fecho o raciocínio.',
++        historico: [...anteriores, ...turno],
++        ferramentasUsadas,
++        artefatos,
++        passos: passo,
++      };
++    }
+     const chamadas = escolha.message.tool_calls || [];
+ 
+     if (!chamadas.length) {
+       const texto = escolha.message.content || '';
+       turno.push({ role: 'assistant', content: texto });
++      if (!texto.trim()) {
++        // O modelo encerrou sem dizer nada (acontece quando o teto de saída é atingido no meio do
++        // raciocínio). Bolha vazia na tela é pior que uma frase honesta.
++        return {
++          tipo: 'resposta',
++          texto: 'Não consegui formular a resposta dentro do limite desta mensagem. Tente pedir de forma mais específica ou em partes.',
++          historico: [...anteriores, ...turno],
++          ferramentasUsadas,
++          artefatos,
++          passos: passo,
++        };
++      }
+       return { tipo: 'resposta', texto, historico: [...anteriores, ...turno], ferramentasUsadas, artefatos, passos: passo };
+     }
+ 
+@@ -188,9 +326,13 @@
+       };
+     }
+ 
+-    turno.push(escolha.message);
++    turno.push(limparMensagemAssistente(escolha.message));
+     mensagens.push(escolha.message);
+ 
++    // Orçamento repartido entre as chamadas do lote: seis ferramentas devolvendo o máximo cada uma
++    // somariam mais texto do que a conversa inteira. Cada uma leva a sua fatia.
++    const limitePorChamada = Math.max(1500, Math.floor(MAX_CHARS_LOTE_FERRAMENTAS / Math.max(1, chamadas.length)));
++
+     // Leituras independentes rodam em paralelo. Quando o modelo pede três buscas de uma vez,
+     // esperar uma por uma triplicaria o tempo da resposta sem nenhuma razão.
+     const resultados = await Promise.all(
+@@ -208,10 +350,12 @@
+       ferramentasUsadas.push({ nome: r.nome, ok: r.ok !== false });
+       const artefato = extrairArtefato(r.nome, r.saida);
+       if (artefato) artefatos.push(artefato);
+-      const conteudo = truncar(JSON.stringify(r.saida));
+-      const msgFerramenta = { role: 'tool', tool_call_id: r.chamada.id, content: conteudo };
+-      turno.push(msgFerramenta);
+-      mensagens.push(msgFerramenta);
++      const bruto = JSON.stringify(r.saida);
++      // Duas versões do mesmo resultado, de propósito: o modelo precisa do detalhe AGORA, para
++      // responder; a conversa daqui para frente só precisa lembrar o que foi consultado. Manter a
++      // versão longa no histórico era o que fazia a conversa engordar até estourar a cota.
++      mensagens.push({ role: 'tool', tool_call_id: r.chamada.id, content: truncar(bruto, Math.min(MAX_CHARS_RESULTADO, limitePorChamada)) });
++      turno.push({ role: 'tool', tool_call_id: r.chamada.id, content: truncar(bruto, MAX_CHARS_RESULTADO_HISTORICO) });
+     }
+   }
+ 
+@@ -234,6 +378,10 @@
+   montarSystemPrompt,
+   GROQ_MODEL,
+   MAX_PASSOS,
++  podarHistorico,
++  MAX_CHARS_HISTORICO,
++  MAX_CHARS_RESULTADO,
++  TIMEOUT_GROQ_MS,
+   // Reexportados para não quebrar quem já importava daqui (server.js, testes): o registro mudou de
+   // lugar, o contrato do módulo não.
+   FERRAMENTAS: registro.FERRAMENTAS,
+--- server.js.orig	2026-09-13 05:13:48.765438966 +0000
++++ server.js	2026-09-13 05:17:32.889454244 +0000
+@@ -7,11 +7,29 @@
+ const express = require('express');
+ const cors = require('cors');
+ const path = require('path');
+-const { pool, migrate, transaction } = require('./db');
++const { pool, migrate, migrateComRetentativa, transaction } = require('./db');
+ const { getClient: getGroqClient, conduzirTurno, executarFerramenta, extrairArtefato, buscarFerramenta, FERRAMENTAS, GROQ_MODEL, CATEGORIAS } = require('./chat');
+ const artefatosLib = require('./lib/artefatos');
+ const ferramentasFinanceiro = require('./tools/financeiro');
+ 
++// ---------- Rede de segurança do processo ----------
++// Estes dois handlers não existiam, e a ausência deles é parte de por que o serviço "caía muito".
++// A partir do Node 15, uma promessa rejeitada sem .catch() DERRUBA O PROCESSO — mesmo que a falha
++// tenha sido num detalhe lateral (uma limpeza em segundo plano, um socket que fechou). Um app web
++// não deveria morrer inteiro, com todas as requisições em andamento, por causa disso.
++//
++// A escolha aqui é registrar e continuar de pé. É deliberadamente diferente do conselho padrão
++// ("logue e saia"), que existe para processos que podem ter ficado em estado inconsistente. Não é o
++// caso aqui: o servidor não guarda estado crítico em memória (a única coisa são as ações pendentes,
++// e perdê-las já é tratado, com mensagem explicando), enquanto morrer significa derrubar todo mundo
++// que estiver usando. Se a causa for estrutural, ela aparece no log em vez de sumir num reinício.
++process.on('unhandledRejection', (motivo) => {
++  console.error('[processo] promessa rejeitada sem tratamento (servidor segue de pé):', motivo && (motivo.stack || motivo.message || motivo));
++});
++process.on('uncaughtException', (err) => {
++  console.error('[processo] exceção não capturada (servidor segue de pé):', err && (err.stack || err.message));
++});
++
+ const app = express();
+ app.use(cors());
+ // 5 MB em vez do padrão de 100 KB: o chat agora manda junto um retrato da tela (tabela de preços,
+@@ -532,9 +550,32 @@
+ // ESCRITA nunca executa na mesma resposta em que foi pedida: volta como "ação pendente" com os
+ // parâmetros exatos, e só executa se uma mensagem seguinte confirmar aquela pendência específica
+ // pelo id. Essa é a mesma regra dos botões do app — nada grava sem um clique consciente.
+-const acoesPendentes = new Map(); // id -> {ferramenta, args, contexto} — em memória; perdido se o servidor reiniciar, o que é aceitável: a pessoa só precisa pedir de novo.
++const acoesPendentes = new Map(); // id -> {ferramenta, args, contexto, criadaEm} — em memória; perdido se o servidor reiniciar, o que é aceitável: a pessoa só precisa pedir de novo.
+ let proximoIdPendente = 1;
+ 
++// Uma pendência que ninguém confirma ficava guardada para sempre, junto com o contexto inteiro da
++// tela que veio com ela (tabela de preços, configuração). Numa instância pequena, isso é um
++// vazamento lento e silencioso: a memória sobe até o serviço ser morto por falta dela, o que parece
++// uma queda aleatória. Cartão de confirmação que passou da validade não seria confirmado mesmo.
++const PENDENCIA_VALIDADE_MS = 30 * 60 * 1000;
++const MAX_PENDENCIAS = 200;
++
++// Quantos turnos de chat podem estar em andamento ao mesmo tempo neste processo.
++const MAX_CHAT_CONCORRENTE = Number(process.env.MAX_CHAT_CONCORRENTE) || 4;
++let chatsEmVoo = 0;
++
++function limparPendenciasVencidas() {
++  const corte = Date.now() - PENDENCIA_VALIDADE_MS;
++  for (const [id, p] of acoesPendentes) {
++    if ((p.criadaEm || 0) < corte) acoesPendentes.delete(id);
++  }
++  // Teto absoluto, caso cheguem muitas dentro da janela de validade: descarta as mais antigas
++  // (o Map do JS preserva a ordem de inserção).
++  while (acoesPendentes.size > MAX_PENDENCIAS) {
++    acoesPendentes.delete(acoesPendentes.keys().next().value);
++  }
++}
++
+ // A pendência guarda o contexto que veio com o pedido ORIGINAL, não o da confirmação. Se alguém
+ // mexer nos valores-hora entre pedir e confirmar, o que será gravado continua sendo exatamente o
+ // que a pessoa viu descrito no cartão de confirmação — e não um recálculo silencioso.
+@@ -577,12 +618,22 @@
+   // caminho novo é mandar tudo dentro de `contexto`.
+   const ctx = { ...(contexto || {}), taxasHora: (contexto && contexto.taxasHora) || taxasHora };
+ 
++  // Um turno de chat pode gerar imagem (sharp), montar um .pptx e um .docx — cada um desses aloca
++  // dezenas de MB de uma vez. Várias pessoas mandando mensagem ao mesmo tempo multiplicavam isso até
++  // o processo ser morto por falta de memória, que do lado de fora parece exatamente uma queda. É
++  // melhor pedir para a quarta pessoa esperar dez segundos do que derrubar as três primeiras.
++  if (chatsEmVoo >= MAX_CHAT_CONCORRENTE) {
++    return res.status(503).json({ error: 'Estou respondendo a várias pessoas neste instante. Manda de novo em alguns segundos.' });
++  }
++  chatsEmVoo++;
++
+   try {
+     const turno = await conduzirTurno({ client, mensagem, historico, contexto: ctx });
+ 
+     if (turno.tipo === 'pendente') {
++      limparPendenciasVencidas();
+       const id = String(proximoIdPendente++);
+-      acoesPendentes.set(id, { ferramenta: turno.ferramenta, args: turno.args, contexto: ctx });
++      acoesPendentes.set(id, { ferramenta: turno.ferramenta, args: turno.args, contexto: ctx, criadaEm: Date.now() });
+       return res.json({
+         tipo: 'pendente',
+         idPendencia: id,
+@@ -603,24 +654,64 @@
+       passos: turno.passos,
+     });
+   } catch (e) {
+-    // Qualquer falha da API do Groq (limite diário estourado, chave inválida, indisponibilidade)
+-    // vira uma mensagem clara para a pessoa, nunca um erro genérico — a Quara de botões continua
+-    // funcionando normalmente mesmo com o chat fora do ar.
+-    const detalhe = e && e.status === 429 ? ' (limite de requisições da API atingido)' : '';
+-    console.error('Falha no chat:', e && e.message);
+-    return res.status(502).json({ error: `O chat está indisponível no momento${detalhe}. O resto do app continua funcionando normalmente.` });
++    // Qualquer falha da API do Groq vira uma mensagem clara para a pessoa — a Quara de botões
++    // continua funcionando normalmente mesmo com o chat fora do ar.
++    //
++    // Antes, tudo virava a MESMA frase ("o chat está indisponível"), e é por isso que o problema
++    // ficou tanto tempo sem diagnóstico: "cota da conta estourou por hoje", "essa conversa ficou
++    // longa demais" e "a chave está errada" pedem três providências completamente diferentes, e as
++    // três apareciam idênticas na tela. Agora cada uma se identifica.
++    const status = e && e.status;
++    const msg = String((e && e.message) || '');
++    console.error('[chat] falha:', status || '', msg);
++
++    let texto;
++    let httpStatus = 502;
++    if (status === 429 || /rate.?limit|too many requests/i.test(msg)) {
++      texto = 'A cota da API de linguagem foi atingida agora há pouco. Espere um minuto e mande de novo — se persistir o dia inteiro, o limite diário da conta acabou e renova amanhã.';
++      httpStatus = 429;
++    } else if (status === 413 || /context.?length|too large|maximum context|reduce the length/i.test(msg)) {
++      texto = 'Esta conversa ficou comprida demais para uma mensagem só. Comece uma conversa nova (recarregue a página) que eu volto com a janela limpa.';
++      httpStatus = 413;
++    } else if (status === 401 || status === 403) {
++      texto = 'A chave da API de linguagem foi recusada. Alguém com acesso ao painel precisa conferir a GROQ_API_KEY nas variáveis de ambiente.';
++    } else if (/timeout|aborted|ETIMEDOUT|ECONNRESET|socket hang up/i.test(msg) || (e && e.name === 'APIConnectionTimeoutError')) {
++      texto = 'O modelo demorou demais para responder e eu desisti de esperar. Tente de novo — normalmente passa.';
++      httpStatus = 504;
++    } else {
++      texto = 'O chat está indisponível no momento. O resto do app continua funcionando normalmente.';
++    }
++    return res.status(httpStatus).json({ error: texto });
++  } finally {
++    chatsEmVoo--;
+   }
+ });
+ 
+ // ---------- Saúde do serviço ----------
+ 
+-app.get('/api/health', (req, res) => {
++app.get('/api/health', async (req, res) => {
++  // O banco entrou no health check porque "o processo está vivo" nunca foi a pergunta interessante:
++  // o modo de falha real é o app de pé e o Postgres fora, e nesse estado o health antigo respondia
++  // ok:true alegremente. uptime e memória ajudam a distinguir "caiu" de "foi reiniciado" quando
++  // alguém reclama de instabilidade — se o uptime é sempre pequeno, o processo está reiniciando.
++  let banco = 'ok';
++  try {
++    await pool.query('SELECT 1');
++  } catch (e) {
++    banco = 'erro: ' + (e.message || 'desconhecido');
++  }
++  const mem = process.memoryUsage();
+   // Além do "está de pé?", diz o que está de fato utilizável. Como várias capacidades dependem de
+   // variável de ambiente (busca do Google, chave do DataJud, chave do Groq), sem isso a única
+   // forma de descobrir que uma delas ficou de fora do deploy seria ela falhar na frente do usuário.
+   res.json({
+-    ok: true,
++    ok: banco === 'ok',
+     timestamp: Date.now(),
++    banco,
++    uptimeSegundos: Math.round(process.uptime()),
++    memoriaMB: Math.round(mem.rss / 1024 / 1024),
++    chatsEmVoo,
++    pendencias: acoesPendentes.size,
+     modelo: GROQ_MODEL,
+     ferramentas: FERRAMENTAS.length,
+     categorias: CATEGORIAS,
+@@ -642,6 +733,14 @@
+   });
+ });
+ 
++// Rota de API que não existe responde JSON, não o HTML do app. Sem isto, um endpoint errado (ou um
++// front-end desatualizado depois de um deploy) recebia a página inteira, o `await r.json()` do
++// navegador estourava, e a tela dizia "não foi possível falar com o servidor" — a mensagem de
++// servidor fora do ar para um servidor que estava perfeitamente de pé.
++app.use('/api', (req, res) => {
++  res.status(404).json({ error: `Endpoint não encontrado: ${req.method} /api${req.path}` });
++});
++
+ // Qualquer rota não-API cai no HTML (SPA-style), exceto se o arquivo estático já respondeu antes.
+ // Express 5 (path-to-regexp v6+) exige um nome de parâmetro no wildcard — '*' sozinho não é mais
+ // uma sintaxe válida de rota coringa.
+@@ -649,16 +748,74 @@
+   res.sendFile(path.join(__dirname, 'public', 'index.html'));
+ });
+ 
++// ---------- Tratamento central de erros ----------
++// Precisa ser o ÚLTIMO app.use, e precisa ter os quatro parâmetros — é assim que o Express reconhece
++// um middleware de erro.
++//
++// O Express 5 encaminha para cá as promessas rejeitadas das rotas async, então o servidor não morria
++// por causa delas. Mas o tratador padrão responde HTML, e quase toda rota deste arquivo é consumida
++// por um `fetch(...).then(r => r.json())` no navegador: a resposta de erro em HTML quebrava o parse
++// no cliente e virava "erro de conexão" na tela. Um JSON com a causa certa faz o app degradar em vez
++// de aparentar ter caído.
++// eslint-disable-next-line no-unused-vars
++app.use((err, req, res, next) => {
++  const status = err.status || err.statusCode || 500;
++  console.error(`[erro] ${req.method} ${req.originalUrl}:`, err && (err.stack || err.message));
++  if (res.headersSent) return; // resposta já começou a ser enviada: só derrubar a conexão
++  if (err.type === 'entity.too.large') {
++    return res.status(413).json({ error: 'O conteúdo enviado é grande demais. Se for uma restauração de backup, use um arquivo menor; se for o chat, comece uma conversa nova.' });
++  }
++  if (err.type === 'entity.parse.failed') {
++    return res.status(400).json({ error: 'O corpo da requisição não é um JSON válido.' });
++  }
++  res.status(status >= 400 && status < 600 ? status : 500).json({
++    error: status >= 500 ? 'Erro interno no servidor. A equipe consegue ver o detalhe no log.' : err.message || 'Requisição inválida.',
++  });
++});
++
+ const PORT = process.env.PORT || 3000;
+ if (require.main === module) {
+-  migrate()
++  migrateComRetentativa()
+     .then(() => {
+-      app.listen(PORT, () => {
++      const servidor = app.listen(PORT, () => {
+         console.log(`Quara server rodando na porta ${PORT}`);
+       });
++
++      // O proxy que fica na frente do app (Render, Cloudflare, qualquer um) reaproveita a mesma
++      // conexão TCP para várias requisições. O padrão do Node é fechar a conexão ociosa em 5s —
++      // menos do que o proxy espera. Quando os dois lados discordam, existe uma janela em que o
++      // proxy manda uma requisição por uma conexão que o Node acabou de fechar, e ela volta como
++      // 502 para o usuário. É o tipo de erro que aparece "do nada", em requisição nenhuma
++      // específica, e que faz um serviço saudável parecer instável. Manter o lado do Node maior que
++      // o do proxy fecha essa janela.
++      servidor.keepAliveTimeout = 120_000;
++      servidor.headersTimeout = 125_000; // precisa ser MAIOR que keepAliveTimeout
++      servidor.requestTimeout = 0; // o timeout de verdade é o da chamada ao modelo, em chat.js
++
++      // Todo deploy manda SIGTERM. Sem tratar, as requisições em andamento morrem no meio —
++      // inclusive a de alguém que acabou de clicar em "Confirmar". Com isto, o servidor para de
++      // aceitar conexões novas, termina o que está em curso e só então fecha o banco.
++      let encerrando = false;
++      for (const sinal of ['SIGTERM', 'SIGINT']) {
++        process.on(sinal, () => {
++          if (encerrando) return;
++          encerrando = true;
++          console.log(`[processo] ${sinal} recebido — encerrando com calma.`);
++          servidor.close(async () => {
++            try {
++              await pool.end();
++            } catch (e) {
++              console.error('[pg] erro ao fechar o pool:', e && e.message);
++            }
++            process.exit(0);
++          });
++          // Se algo travar, não ficar pendurado para sempre.
++          setTimeout(() => process.exit(0), 15_000).unref();
++        });
++      }
+     })
+     .catch((err) => {
+-      console.error('Falha ao migrar o banco na inicialização:', err);
++      console.error('Falha ao migrar o banco na inicialização (depois de várias tentativas):', err);
+       process.exit(1);
+     });
+ }
